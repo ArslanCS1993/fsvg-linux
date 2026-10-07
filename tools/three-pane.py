@@ -12,7 +12,7 @@ one pane highlights it in the other two.
         --entry arch/x86/entry/entry_64.S \
         --out kernel/arch/x86/entry/entry_SYSCALL_64.html
 """
-import argparse, html, json, os, re
+import argparse, html, json, os, re, sys
 
 # Fallbacks for this box; override with --trace/--kernel.
 DEF_TRACE = '/root/gh-cpu3d/src/trace.json'
@@ -21,7 +21,10 @@ DEF_ENTRY = 'arch/x86/entry/entry_64.S'
 
 # ---------------------------------------------------------------- the FSVG
 # Hand-written flowchart of entry_SYSCALL_64. `src` is the entry_64.S line it
-# implements, `need` is the fsvgc op it requires (None = compiles today).
+# implements, `need` is the fsvgc ops it uses ('A+B' for several, empty for a
+# shape that expands to none). Whether those ops EXIST is not asserted here --
+# it is looked up in fsvgc at build time, because a hand-written claim about
+# what the language cannot do goes stale the moment the language learns it.
 FLOW = [
     ('entry',   'rect',   'SWAPGS',                                   91,  'SWAPGS'),
     ('tss2',    'rect',   'MOV @TSS_SP2, RSP',                        93,  'MOV'),
@@ -33,9 +36,12 @@ FLOW = [
     ('p_cs',    'rect',   'PUSH USER_CS',                            104,  'PUSH'),
     ('p_ip',    'rect',   'PUSH RCX',                                105,  'PUSH'),
     ('p_ax',    'rect',   'PUSH RAX',                                107,  'PUSH'),
-    ('clear',   'rect',   'PUSH_AND_CLEAR_REGS RAX=-ENOSYS',         109,  'PUSH+CLEAR'),
+    # PUSH_AND_CLEAR_REGS is modelled as the pushes plus the zeroing, and fsvgc
+    # has all of those. The old value named 'CLEAR', an op that never existed as
+    # an opcode -- which is exactly why the page reported a deficit forever.
+    ('clear',   'rect',   'PUSH_AND_CLEAR_REGS RAX=-ENOSYS',         109,  'PUSH+XOR'),
     ('arg0',    'rect',   'MOV RDI, RSP',                            112,  'MOV'),
-    ('arg1',    'rect',   'MOV RSI, EAX',                            114,  'MOV'),
+    ('arg1',    'rect',   'MOVSXD RSI, EAX',                         114,  'MOVSXD'),
     ('call',    'rect',   'CALL do_syscall_64',                      121,  'CALL'),
     ('xen',     'poly',   'Xen PV?',                                 130,  None),
     ('sysret',  'rect',   'POP_REGS  ->  SYSRET',                    139,  'POP+SYSRET'),
@@ -213,11 +219,38 @@ def main():
     rows = load_asm(a.trace, a.limit)
     keep = set(r[0] for r in rows)
 
-    need = {}
+    # What does the language still lack? ASK THE COMPILER.
+    #
+    # This used to be a hardcoded count of shapes whose `need` was non-empty, so
+    # the page went on saying "N shapes need ops fsvgc lacks" long after those
+    # ops were implemented -- a live page asserting a deficit that no longer
+    # existed. Deriving it from fsvgc's own op table means the claim cannot
+    # outlive the fact.
+    sys.path.insert(0, os.environ.get('FSVG_DIR', '/root/fsvg'))
+    try:
+        import fsvgc
+        available = {k.upper() for k in fsvgc.ARITY}
+    except Exception as e:
+        ap.error('cannot import fsvgc to check which ops exist (%s). Set '
+                 'FSVG_DIR to the fsvg repo.' % e)
+
+    unknown = {}
     for sid, kind, label, line, n in FLOW:
-        if n:
-            need[n] = need.get(n, 0) + 1
-    missing = sum(1 for x in FLOW if x[4])
+        for part in (n or '').split('+'):
+            part = part.strip()
+            if part and part.upper() not in available:
+                unknown.setdefault(part, []).append(sid)
+    missing = sum(len(v) for v in unknown.values())
+
+    if missing:
+        deficit = '<b>%d</b> shapes need ops fsvgc lacks' % missing
+        legend = ('missing ops: ' + ' '.join(
+            '<span class=k>%s</span>' % k for k in sorted(unknown)))
+    else:
+        deficit = 'every op it uses exists in fsvgc'
+        legend = ('ops used: ' + ' '.join(
+            '<span class=k>%s</span>' % k for k in sorted(
+                {p.strip() for *_x, n in FLOW for p in (n or '').split('+') if p.strip()})))
 
     doc = f"""<!doctype html><meta charset="utf-8">
 <title>FSVG &middot; {a.title}</title><style>{CSS}</style>
@@ -226,19 +259,21 @@ def main():
   <span><b>{len(rows)}</b> real instructions</span>
   <span><b>{len(keep)}</b> source lines</span>
   <span><b>{len(FLOW)}</b> flow shapes</span>
-  <span><b>{missing}</b> shapes need ops fsvcg lacks</span>
+  <span>{deficit}</span>
   <span>click anything &mdash; Esc clears</span>
 </header>
 <main>
   <pane><h2>1 &middot; FSVG flowchart</h2>{build_svg()}
-    <div class="legend">missing ops:{' '.join(f'<span class=k>{k}</span>' for k in sorted(need))}</div></pane>
+    <div class="legend">{legend}</div></pane>
   <pane><h2>2 &middot; generated assembly (real trace)</h2>{build_asm_rows(rows)}</pane>
   <pane><h2>3 &middot; original Linux source</h2>{build_src(a.kernel, a.entry, a.lo, a.hi, keep)}</pane>
 </main>
 <script>{JS}</script>"""
     open(a.out, 'w').write(doc)
     print(f"{a.out}  {len(doc)} bytes  |  {len(rows)} insn  |  {len(keep)} src lines"
-          f"  |  {len(FLOW)} shapes  |  {missing} need new ops")
+          f"  |  {len(FLOW)} shapes  |  "
+          + ("%d need new ops" % missing if missing
+             else "all ops it uses exist"))
 
 if __name__ == '__main__':
     main()
