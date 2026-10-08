@@ -68,6 +68,7 @@ class CPU:
         s.msr={}
         s.mem={}
         s.f={'CF':0,'ZF':0,'SF':0,'OF':0}
+        s.wlog=[]                    # memory writes, logged with their old value
         s.rip=LO
     def rd(s,op):
         op=op.strip()
@@ -96,14 +97,23 @@ class CPU:
             s.cr[int(op[3:])]=val; return True
         m=re.match(r'(?:(-?0x[0-9a-f]+))?\(%rip\)',op)
         if m:
-            s.mem[s.rip+(int(m.group(1),0) if m.group(1) else 0)]=val; return True
+            s.wrmem(s.rip+(int(m.group(1),0) if m.group(1) else 0), val); return True
         m=re.match(r'(?:(-?0x[0-9a-f]+))?\((%\w+)\)',op)
         if m:
             off=int(m.group(1),0) if m.group(1) else 0
-            b,_=rname(m.group(2)); s.mem[((s.r[b] if b else 0)+off)&M64]=val; return True
+            b,_=rname(m.group(2)); s.wrmem(((s.r[b] if b else 0)+off)&M64, val); return True
         return False
+    def wrmem(s,addr,val):
+        """Record the write as well as doing it. A window sample relative to RSP
+        cannot recover the old value once RSP has moved, so log it at write time —
+        otherwise a push/pop looks like it changed a qword at an address it never
+        touched."""
+        addr&=M64
+        old=s.mem.get(addr)
+        s.mem[addr]=val&M64
+        s.wlog.append((addr,old,val&M64))
     def push(s,v):
-        s.r['rsp']=(s.r['rsp']-8)&M64; s.mem[s.r['rsp']]=v&M64
+        s.r['rsp']=(s.r['rsp']-8)&M64; s.wrmem(s.r['rsp'], v&M64)
     def pop(s):
         v=s.mem.get(s.r['rsp'],0); s.r['rsp']=(s.r['rsp']+8)&M64; return v
     def setf(s,res,cf=None,of=0,width=64):
@@ -208,6 +218,7 @@ def execute(steps):
         before={k:v for k,v in cpu.r.items()}
         crb=dict(cpu.cr); msrb=dict(cpu.msr); fb=dict(cpu.f)
         mem0=[cpu.mem.get((cpu.r['rsp']+8*k)&M64,0) for k in range(4)]
+        cpu.wlog=[]
         t=ins['t']; mn,ops=parse_ops(t); base=mn.split('.')[0]
         nxt=ins['a']+len(ins['b'])//2
         outside=None
@@ -299,7 +310,7 @@ def execute(steps):
         trace.append({'ins':ins,'kind':kind,'station':station,'motion':motion,
                       'regs':dict(cpu.r),'cr':dict(cpu.cr),'msr':dict(cpu.msr),'f':dict(cpu.f),
                       'prev':before,'prevcr':crb,'prevf':fb,'prevmsr':msrb,
-                      'mem':memwin,'premem':mem0,'outside':outside})
+                      'mem':memwin,'premem':mem0,'mw':list(cpu.wlog),'outside':outside})
     return trace
 
 # ---------------------------------------------------------------- source
@@ -369,11 +380,14 @@ def delta_rows(s):
     for fl in ('CF','ZF','SF','OF'):
         a=str(s['prevf'][fl]); b=str(s['f'][fl])
         if a!=b: rows.append({'w':'flag','item':fl,'before':a,'after':b,'what':FLAGWHAT[fl]})
-    for k in range(4):
-        a=s['premem'][k]; b=s['mem'][k]
-        if a!=b:
-            rows.append({'w':'mem','item':'stack+%d'%(8*k),'before':a,'after':b,
-                         'what':'a word the kernel just pushed'})
+    # memory: what the instruction actually WROTE, at absolute addresses. The old
+    # window-based diff labelled rows "stack+0" relative to RSP, so once RSP moved
+    # (push/pop/popf) the same label pointed at a different address and the
+    # comparison was meaningless.
+    for a,o,n in s.get('mw',[]):
+        if o==n: continue
+        rows.append({'w':'mem','item':'mem @'+(a if str(a).startswith('0x') else '0x%x'%a),
+                     'before':o,'after':n,'what':'a word this instruction wrote to memory'})
     return rows
 
 # ---------------------------------------------------------------- images
@@ -484,6 +498,9 @@ def main():
             s[key]={k:('0x%x'%(v & M64)) for k,v in s[key].items()}
         s['mem']=['0x%x'%v for v in s['mem']]
         s['premem']=['0x%x'%v for v in s['premem']]
+        s['mw']=[[('0x%x'%(a & M64)),
+                  ('(nothing there before)' if o is None else '0x%x'%(o & M64)),
+                  '0x%x'%(n & M64)] for a,o,n in s['mw']]
         s['hw']=hw_rows(s['ins'])
         s['src']=window(lines,s['ins']['ln'])
         s['delta']=delta_rows(s)          # the one definition of "what changed"
