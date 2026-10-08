@@ -207,6 +207,7 @@ def execute(steps):
         i=idx[cpu.rip]; ins=steps[i]
         before={k:v for k,v in cpu.r.items()}
         crb=dict(cpu.cr); msrb=dict(cpu.msr); fb=dict(cpu.f)
+        mem0=[cpu.mem.get((cpu.r['rsp']+8*k)&M64,0) for k in range(4)]
         t=ins['t']; mn,ops=parse_ops(t); base=mn.split('.')[0]
         nxt=ins['a']+len(ins['b'])//2
         outside=None
@@ -298,7 +299,7 @@ def execute(steps):
         trace.append({'ins':ins,'kind':kind,'station':station,'motion':motion,
                       'regs':dict(cpu.r),'cr':dict(cpu.cr),'msr':dict(cpu.msr),'f':dict(cpu.f),
                       'prev':before,'prevcr':crb,'prevf':fb,'prevmsr':msrb,
-                      'mem':memwin,'outside':outside})
+                      'mem':memwin,'premem':mem0,'outside':outside})
     return trace
 
 # ---------------------------------------------------------------- source
@@ -308,6 +309,161 @@ def source_lines():
 def window(lines, ln, n=6):
     a=max(1,ln-n); b=min(len(lines),ln+n)
     return [{'n':i,'t':lines[i-1]} for i in range(a,b+1)]
+
+# ---------------------------------------------------------------- before/after
+# One definition of "what the hardware changed", computed here and embedded.
+# The page, the PNG cards and the assertions all read THIS — three copies of a
+# diff would drift, and the drift would be invisible.
+CRWHAT={'0':'the master switch — turns paging and protection on or off',
+        '3':'page-table base — tells the CPU where its page tables live',
+        '4':'feature switches — PAE, PGE, SMEP and SMAP'}
+MSRWHAT={0xc0000080:'EFER — extended feature enable (long mode, syscall)',
+         0xc0000101:'GS base — the per-CPU data pointer',
+         0x1b:'APIC base', 0x175:'SYSENTER flags', 0x176:'SYSENTER CS',
+         0x177:'SYSENTER ESP', 0x178:'SYSENTER EIP'}
+FLAGWHAT={'CF':'carry — borrow out of the top bit','ZF':'zero — the last result was zero',
+          'SF':'sign — the top bit of the last result','OF':'overflow — signed overflow'}
+RWHAT={'rsp':'stack pointer — the kernel is building its own stack here',
+       'rdi':'first argument','rsi':'second argument — boot_params at entry',
+       'rcx':'here: the number of the MSR being written',
+       'rdx':'here: the high half of the value going into the MSR',
+       'rax':'accumulator — here, the value being installed',
+       'r15':'a saved copy of boot_params (rsi at entry)'}
+
+def _pick(d,k):
+    """cpu.cr is keyed by INT (0,3,4); json.dumps later stringifies those keys,
+    so a lookup by the wrong type returns None on BOTH sides, compares equal,
+    and silently drops the change. Look up either way."""
+    if k in d: return d[k]
+    for alt in (str(k), int(k) if str(k).lstrip('-').isdigit() else None):
+        if alt is not None and alt in d: return d[alt]
+    return None
+
+def delta_rows(s):
+    rows=[]
+    for r in R64:
+        a=s['prev'].get(r); b=s['regs'].get(r)
+        if a!=b: rows.append({'w':'reg','item':r.upper(),'before':a,'after':b,'what':RWHAT.get(r,'')})
+    for cr in (0,3,4):
+        a=_pick(s['prevcr'],cr); b=_pick(s['cr'],cr)
+        if a!=b:
+            rows.append({'w':'cr','item':'CR%d'%cr,
+                         'before':a if a is not None else '(unset)',
+                         'after':b,  'what':CRWHAT[str(cr)]})
+    # the msr dict also carries bookkeeping sentinels (__gdtr); they are not MSRs
+    msrkeys=[m for m in set(list(s['prevmsr'])+list(s['msr'])) if not str(m).startswith('__')]
+    for m in sorted(msrkeys, key=lambda x:int(x)):
+        a=s['prevmsr'].get(m); b=s['msr'].get(m)
+        if a!=b:
+            # an MSR that was never written has no "before" we can honestly print
+            rows.append({'w':'msr','item':'MSR 0x%x'%int(m),
+                         'before':a if a is not None else '(never written)',
+                         'after':b,'what':MSRWHAT.get(int(m),'')})
+    # the GDT load: the interpreter records the descriptor table limit under a
+    # sentinel key, so it was being filtered out of the MSR list and the single
+    # most meaningful write in head_64.S showed as "nothing changed".
+    a=s['prevmsr'].get('__gdtr'); b=s['msr'].get('__gdtr')
+    if a!=b:
+        rows.append({'w':'gdt','item':'GDTR','before':a if a is not None else '(unset)','after':b,
+                     'what':'the GDT the CPU will use for segments — 0x7f = 16 descriptors'})
+    for fl in ('CF','ZF','SF','OF'):
+        a=str(s['prevf'][fl]); b=str(s['f'][fl])
+        if a!=b: rows.append({'w':'flag','item':fl,'before':a,'after':b,'what':FLAGWHAT[fl]})
+    for k in range(4):
+        a=s['premem'][k]; b=s['mem'][k]
+        if a!=b:
+            rows.append({'w':'mem','item':'stack+%d'%(8*k),'before':a,'after':b,
+                         'what':'a word the kernel just pushed'})
+    return rows
+
+# ---------------------------------------------------------------- images
+def make_images(payload, outdir):
+    """One before/after PNG card per hardware beat, plus a single sheet.
+    Drawn from the same `delta` the page renders, so they cannot disagree."""
+    from PIL import Image, ImageDraw, ImageFont
+    os.makedirs(outdir, exist_ok=True)
+    MONO='/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf'
+    MONOB='/usr/share/fonts/truetype/dejavu/DejaVuSansMono-Bold.ttf'
+    def F(sz,b=False): return ImageFont.truetype(MONOB if b else MONO,sz)
+    BG=(13,17,23); PANEL=(22,27,34); STRIP=(11,15,20); INK=(230,237,243)
+    GREY=(139,148,158); DIM=(110,118,129); AMBER=(227,179,65); BLUE=(88,166,255)
+    beats=payload['beats']; steps=payload['steps']
+    def padv(v):
+        s=str(v)
+        return ('0x%016x'%int(s,16)) if s.startswith('0x') else s
+    PAD=22; W=1240; made=[]
+    for n,bi in enumerate(beats,1):
+        s=steps[bi]; rows=s['delta']; shown=rows[:5]
+        H=PAD+54+46+18+30+max(1,len(shown))*58+(30 if rows else 0)+PAD+22
+        im=Image.new('RGB',(W,H),BG); d=ImageDraw.Draw(im)
+        d.rectangle([0,0,W,54],fill=PANEL)
+        d.text((PAD,18),'BOOT FACTORY',font=F(16,True),fill=BLUE)
+        d.text((PAD+174,20),'beat %d of %d'%(n,len(beats)),font=F(14),fill=GREY)
+        t='the first hardware Linux touches'
+        d.text((W-PAD-d.textlength(t,font=F(13)),22),t,font=F(13),fill=DIM)
+        d.rectangle([0,54,W,100],fill=STRIP)
+        d.text((PAD,68),'%s  %s  %s'%(s['ins']['a'],s['ins']['b'],s['ins']['t']),font=F(17),fill=INK)
+        r='head_64.S:%d'%s['ins']['ln']
+        d.text((W-PAD-d.textlength(r,font=F(14)),70),r,font=F(14),fill=GREY)
+        y=PAD+54+46+18; mid=W//2
+        d.text((PAD,y),'BEFORE',font=F(13,True),fill=GREY)
+        d.text((mid+18,y),'AFTER',font=F(13,True),fill=AMBER)
+        y+=26
+        if not shown:
+            d.text((PAD,y+10),'no state change — the destination already held that value',font=F(15),fill=DIM); y+=58
+        for row in shown:
+            d.text((PAD,y),row['item'],font=F(14),fill=GREY)
+            d.text((PAD,y+18),padv(row['before']),font=F(19,True),fill=DIM)
+            d.text((mid-20,y+18),'->',font=F(18,True),fill=(72,79,88))
+            d.text((mid+18,y),row['item'],font=F(14,True),fill=AMBER)
+            d.text((mid+18,y+18),padv(row['after']),font=F(19,True),fill=AMBER)
+            if row['what']: d.text((PAD,y+42),row['what'][:76],font=F(11),fill=DIM)
+            y+=58
+        if len(rows)>5:
+            d.text((PAD,y),'+ %d more changed'%(len(rows)-5),font=F(12),fill=DIM)
+        if rows:
+            y+=26
+            summ='   '.join('%s %s -> %s'%(r['item'],padv(r['before']),padv(r['after'])) for r in rows)
+            d.text((PAD,y),('CHANGED: '+summ)[:150],font=F(12),fill=INK)
+        d.text((PAD,H-24),
+               'real bytes and source lines from vmlinux; values derived by executing the real instruction stream',
+               font=F(10),fill=(72,79,88))
+        p=os.path.join(outdir,'beat-%02d.png'%n); im.save(p); made.append(p)
+    # ---- one sheet: all 12 beats in execution order ----
+    ROWH=60; W2=1560; H=76+len(beats)*ROWH+28
+    im=Image.new('RGB',(W2,H),BG); d=ImageDraw.Draw(im)
+    d.rectangle([0,0,W2,64],fill=PANEL)
+    d.text((PAD,14),'THE 12 MOMENTS LINUX TOUCHES THE HARDWARE',font=F(16,True),fill=BLUE)
+    d.text((PAD,40),'before -> after, in the order the kernel executes them',font=F(12),fill=DIM)
+    y=76
+    for n,bi in enumerate(beats,1):
+        s=steps[bi]; rows=s['delta']
+        if n%2==0: d.rectangle([0,y,W2,y+ROWH],fill=(17,21,27))
+        d.text((PAD,y+10),'%2d'%n,font=F(14,True),fill=BLUE)
+        d.text((PAD+46,y+8),s['ins']['a'],font=F(13),fill=GREY)
+        d.text((PAD+46,y+26),'head_64.S:%d'%s['ins']['ln'],font=F(11),fill=DIM)
+        d.text((PAD+250,y+8),s['ins']['t'],font=F(15,True),fill=INK)
+        summ='   '.join('%s %s -> %s'%(r['item'],padv(r['before']),padv(r['after'])) for r in rows[:3]) or 'read only'
+        d.text((PAD+250,y+30),summ[:120],font=F(12),fill=AMBER)
+        y+=ROWH
+    p=os.path.join(outdir,'all-beats.png'); im.save(p); made.append(p)
+    return made
+
+def check_images(paths):
+    """A PNG that exists is not a PNG that says anything. Check it was painted."""
+    import hashlib
+    from PIL import Image
+    sigs={}; bad=[]; out=[]
+    for p in paths:
+        raw=open(p,'rb').read()
+        sigs.setdefault(hashlib.md5(raw).hexdigest(),[]).append(os.path.basename(p))
+        im=Image.open(p).convert('RGB')
+        n=sum(1 for c in im.getdata() if c!=(13,17,23))
+        frac=n/float(im.width*im.height)
+        out.append((os.path.basename(p),os.path.getsize(p),im.width,im.height,round(frac,3)))
+        if len(raw)<4000 or frac<0.02: bad.append(out[-1])
+    dupes=[v for v in sigs.values() if len(v)>1]
+    return out,bad,dupes
 
 # ---------------------------------------------------------------- main
 def main():
@@ -327,8 +483,10 @@ def main():
         for key in ('regs','cr','msr','prev','prevcr','prevmsr'):
             s[key]={k:('0x%x'%(v & M64)) for k,v in s[key].items()}
         s['mem']=['0x%x'%v for v in s['mem']]
+        s['premem']=['0x%x'%v for v in s['premem']]
         s['hw']=hw_rows(s['ins'])
         s['src']=window(lines,s['ins']['ln'])
+        s['delta']=delta_rows(s)          # the one definition of "what changed"
     data=json.dumps(payload, separators=(',',':'))
     # the JSON lands at STATEMENT position, so it needs a `var D=` — as a bare
     # object literal it parses as a block and D is never defined.
@@ -339,6 +497,29 @@ def main():
     print('hardware beats:',len(beats))
     print('addrs:',trace[0]['ins']['a'],'->',trace[-1]['ins']['a'])
     print('out:',OUT,os.path.getsize(OUT),'bytes')
+    # every hardware beat must actually change the machine, and the images must
+    # actually be painted — an empty PNG still has valid dimensions.
+    nochange=[i for i in beats if not payload['steps'][i]['delta']]
+    print('beats with no state change (read-back, or re-writing the same value):',
+          ', '.join('%s L%d'%(trace[i]['ins']['t'].split()[0],trace[i]['ins']['ln'])
+                    for i in nochange) or 'none')
+    # The invariant that matters: the page must actually SHOW the decisive
+    # hardware writes. A page that silently dropped CR3 would still look whole,
+    # which is exactly how the int-vs-string key bug hid.
+    have=set()
+    for i in beats:
+        for r in payload['steps'][i]['delta']: have.add(r['item'].split()[0])
+    need=['CR0','CR3','CR4','GDTR']
+    missing=[x for x in need if x not in have]
+    print('decisive writes shown:', ', '.join(sorted(have)) or 'none')
+    print('MISSING decisive writes:', missing if missing else 'none')
+    made=make_images(payload, os.path.join(os.path.dirname(OUT),'img'))
+    rows,bad,dupes=check_images(made)
+    print('images: %d, byte-distinct: %d'%(len(made),len(made)-sum(len(d)-1 for d in dupes)))
+    for r in rows: print('   %-16s %7d bytes  %dx%d  painted %.1f%%'%(r[0],r[1],r[2],r[3],r[4]*100))
+    print('blank/tiny images:',bad if bad else 'none')
+    print('duplicate images:',dupes if dupes else 'none')
+    assert not missing and not bad and not dupes, 'gate failed'
     for i in beats[:14]:
         print(f"  beat {i:>3} {trace[i]['ins']['a']} L{trace[i]['ins']['ln']} {trace[i]['ins']['t']}")
 
@@ -374,8 +555,15 @@ main.withdetail{grid-template-columns:250px minmax(0,1fr) 300px}
 .irow.beat .tx::before{content:"\26A1";color:#e3b341;margin-right:4px}
 .irow.past{opacity:.45}
 /* factory */
-#floor{position:relative;min-height:0;overflow:auto;padding:10px;
+#pane-floor{display:flex;flex-direction:column;overflow:hidden}
+#floor{position:relative;min-height:0;flex:1 1 auto;display:flex;flex-direction:column;
+       overflow:hidden;padding:10px;
        background:radial-gradient(circle at 30% 10%,#161b22,#0d1117 70%)}
+/* Only the bays scroll. The before/after board and the robot's narration are
+   pinned: unpinned, they sat ~380px below a 490px pane, i.e. invisible — and a
+   screenshot cannot show that, because the pane clips instead of overflowing. */
+#bayscroll{flex:1 1 auto;min-height:0;overflow:auto}
+#ba,#narr{flex:0 0 auto}
 .grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:7px}
 .bay{background:#161b22;border:1px solid #30363d;border-radius:8px;padding:6px 7px;min-width:0}
 .bay.wide{grid-column:span 2}
@@ -413,6 +601,28 @@ main.withdetail{grid-template-columns:250px minmax(0,1fr) 300px}
   padding:7px 9px;min-height:44px}
 #narr .d{color:#8b949e;font-size:11px;text-transform:uppercase;letter-spacing:.06em}
 #narr .t{color:#e6edf3}
+/* before -> after */
+#ba{margin-top:10px;border:1px solid #21262d;border-radius:8px;background:#0d1117;padding:9px 11px}
+#ba .hd{display:flex;justify-content:space-between;align-items:center;gap:8px;
+  font-size:11px;letter-spacing:.08em;text-transform:uppercase;color:#8b949e;margin-bottom:6px}
+#ba .hd button{font-size:10px;text-transform:none;letter-spacing:0;background:#161b22;color:#c9d1d9;
+  border:1px solid #30363d;border-radius:5px;padding:2px 7px;cursor:pointer}
+#ba .hd button:hover{border-color:#58a6ff}
+#ba .imglink{color:#58a6ff;text-decoration:none;font-size:10px;letter-spacing:0;text-transform:none}
+#ba .row{display:grid;grid-template-columns:minmax(0,1fr) 22px minmax(0,1fr);align-items:start;
+  gap:4px;padding:5px 0;border-top:1px solid #161b22}
+#ba .row:first-of-type{border-top:0}
+#ba .it{font-size:10px;color:#8b949e;text-transform:uppercase;letter-spacing:.05em}
+#ba .bf,#ba .af{font:14px ui-monospace,Menlo,Consolas,monospace;overflow-wrap:anywhere}
+#ba .bf{color:#6e7681}
+#ba .af{color:#c9d1d9}
+#ba .row.chg .af{color:#e3b341;font-weight:600}
+#ba .row.chg .bf{color:#484f58}
+#ba .arw{text-align:center;color:#484f58;font-size:13px;padding-top:12px}
+#ba .what{font-size:10px;color:#6e7681;margin-top:2px}
+#ba .same{font-size:12px;color:#6e7681;padding:2px 0}
+#foot a{color:#58a6ff;text-decoration:none}
+#foot a:hover{text-decoration:underline}
 /* right column */
 .srow{display:flex;gap:8px;padding:1px 8px}
 .srow .n{color:#484f58;flex:0 0 34px;text-align:right}
@@ -446,7 +656,8 @@ footer{flex:0 0 auto;padding:5px 12px;background:#161b22;border-top:1px solid #3
   <section class="pane"><h2>Instructions (real)</h2><div id="list"></div></section>
   <section class="pane" id="pane-floor"><h2>Hardware floor</h2>
     <div id="floor">
-      <div class="grid" id="bays"></div>
+      <div id="bayscroll"><div class="grid" id="bays"></div></div>
+      <div id="ba"></div>
       <div id="narr"><div class="d" id="nkind">ready</div><div class="t" id="ntext"></div></div>
       <div id="robot"><div class="carry" id="carry"></div><div class="body"><div class="eye"></div>
         <div class="eye r"></div><div class="claw"></div></div></div>
@@ -470,15 +681,52 @@ var RA={eax:'rax',ebx:'rbx',ecx:'rcx',edx:'rdx',esi:'rsi',edi:'rdi',ebp:'rbp',es
         al:'rax',bl:'rbx',cl:'rcx',dl:'rdx'};
 (function(){for(var q=8;q<16;q++){RA['r'+q+'d']='r'+q;RA['r'+q+'w']='r'+q;RA['r'+q+'b']='r'+q;}})();
 function canon(r){r=String(r).replace(/%/g,'').trim();return RA[r]||r;}
+/* a hardware dump shows full 64-bit words — padding the hex is what makes the
+   bit that actually changed visible at a glance. Non-values pass through. */
+function pad(v){v=String(v);return v.indexOf('0x')===0?('0x'+hex(BigInt(v))):v;}
 
-function changed(i,key,k){ // diff effect of instruction i
-  if(i<0) return false;
-  var a=STEPS[i][key], b=i+1<N?STEPS[i+1][key]:null;
-  if(key==='regs'||key==='cr'||key==='msr'||key==='f'){
-    var nv=a[k], nv2=i+1<N?STEPS[i+1][key][k]:undefined;
-    return String(nv)!==String(nv2);
+/* Before/after is NOT recomputed here. It is computed once in Python
+   (delta_rows) and shipped as st.delta, so the page and the PNG cards cannot
+   disagree. The JS diff this replaces was also off by one — it compared step i
+   against step i+1, so it lit up the wrong instruction's changes. */
+var showAll=false;
+function toggleBA(){ showAll=!showAll; draw(cur); }
+function fullRows(st){
+  var o=[];
+  D.regs.forEach(function(r){ o.push({w:'reg',item:r.toUpperCase(),before:st.prev[r],after:st.regs[r],what:''}); });
+  ['0','3','4'].forEach(function(c){ o.push({w:'cr',item:'CR'+c,before:st.prevcr[c],after:st.cr[c],what:''}); });
+  Object.keys(st.msr).forEach(function(m){
+    if(m.slice(0,2)==='__') return;
+    o.push({w:'msr',item:'MSR 0x'+Number(m).toString(16),
+            before:(st.prevmsr[m]!==undefined?st.prevmsr[m]:'\u2014'),after:st.msr[m],what:''});
+  });
+  ['CF','ZF','SF','OF'].forEach(function(f){
+    o.push({w:'flag',item:f,before:String(st.prevf[f]),after:String(st.f[f]),what:''}); });
+  return o;
+}
+function drawBA(i){
+  var st=STEPS[i], rows=showAll?fullRows(st):(st.delta||[]), bi=beats.indexOf(i);
+  var h='<div class="hd"><span>Before &rarr; After</span><span>'+
+    '<button onclick="toggleBA()">'+(showAll?'only what changed':'show all of it')+'</button>'+
+    (bi>=0?'&nbsp;<a class="imglink" href="img/beat-'+('0'+(bi+1)).slice(-2)+'.png" target="_blank">PNG &darr;</a>':'')+
+    '</span></div>';
+  if(!rows.length){
+    var msg = (st.kind==='msr-r') ? 'Read only \u2014 the machine is unchanged.'
+            : (st.kind==='msr-w'||st.kind==='cr')
+              ? 'It wrote, but the destination already held that value \u2014 no state change.'
+            : 'No state change \u2014 the destination already held that value.';
+    h+='<div class="same">'+msg+'</div>';
   }
-  return false;
+  rows.forEach(function(r){
+    var ch=(String(r.before)!==String(r.after));
+    h+='<div class="row'+(ch?' chg':'')+'">'+
+       '<div><div class="it">'+esc(r.item)+'</div><div class="bf">'+esc(pad(r.before))+'</div></div>'+
+       '<div class="arw">&rarr;</div>'+
+       '<div><div class="it">'+esc(r.item)+'</div><div class="af">'+esc(pad(r.after))+'</div>'+
+       (r.what?'<div class="what">'+esc(r.what)+'</div>':'')+'</div></div>';
+  });
+  if(showAll) h+='<div class="same">'+rows.length+' parts listed \u2014 the amber ones are what this one instruction changed.</div>';
+  $('ba').innerHTML=h;
 }
 function rowState(i){ // which regs this step reads / writes
   var r={}, st=STEPS[i];
@@ -543,9 +791,10 @@ function buildFloor(){
 function draw(i){
   var st=STEPS[i];
   /* registers */
-  var rs=rowState(i), rh='';
+  var rs=rowState(i), rh='', dset={};
+  (st.delta||[]).forEach(function(x){ if(x.w==='reg') dset[x.item]=1; });
   for(var k=0;k<D.regs.length;k++){
-    var r=D.regs[k], cls=rs[r]? (rs[r]==='R'?'rd':'wr') : (changed(i,'regs',r)?'wr':'');
+    var r=D.regs[k], cls=rs[r]? (rs[r]==='R'?'rd':'wr') : (dset[r.toUpperCase()]?'wr':'');
     rh+='<div class="bin '+cls+'" id="bin-'+r+'"><span class="nm">'+r.toUpperCase()+
         '</span><span class="vl">'+z(st.regs[r])+'</span></div>';
   }
@@ -574,6 +823,7 @@ function draw(i){
       hex(BigInt(st.regs.rsp)+BigInt(k3*8)).slice(-6)+' &nbsp;<b>'+z(st.mem[k3])+'</b></span></div>';
   }
   $('stack').innerHTML=stk;
+  drawBA(i);
   /* source */
   var h='';
   st.src.forEach(function(l){
@@ -649,6 +899,8 @@ function moveRobot(i){
   if(carry){ if(isCarry&&a[0]){carry.textContent=canon(a[0]);carry.className='carry on';}
              else {carry.className='carry';} }
   highlight(tgt);
+  /* the bays scroll now, so bring the robot's destination into view */
+  if(el.scrollIntoView){ try{ el.scrollIntoView({block:'nearest',inline:'nearest'}); }catch(e){} }
 }
 function highlight(tgt){
   var ids=['st-alu','st-msr','st-cr','st-gdt','st-addr','st-door'];
@@ -681,7 +933,9 @@ document.onkeydown=function(e){
 };
 buildList(); buildFloor(); select(0);
 $('foot').innerHTML='Real code: '+D.file+' &mdash; disassembled from the real vmlinux at '+hex(D.lo)+
-  '. Instruction bytes, addresses and source lines are exact; control flow is followed by address, so calls, returns and jumps really execute.';
+  '. Instruction bytes, addresses and source lines are exact; control flow is followed by address, so calls, returns and jumps really execute. '+
+  '<a href="img/all-beats.png" target="_blank">all 12 hardware moments as one image &darr;</a> &middot; '+
+  '<a href="img/beat-01.png" target="_blank">before/after PNG cards &darr;</a>';
 </script></body></html>
 '''
 if __name__=='__main__': main()

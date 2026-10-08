@@ -5,7 +5,7 @@ mkindex.py -- build the GitHub Pages landing page.
 Lists every built three-pane page under kernel/, with the counts each one
 reports, so the index can never drift from what build.sh actually produced.
 """
-import argparse, html, os, re
+import argparse, glob, html, os, re
 
 HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -47,11 +47,13 @@ def main():
         mb = re.search(r'"beats":\[([0-9,]*)\]', fh)
         if mt:
             nb = len([x for x in (mb.group(1).split(',') if mb else []) if x])
+            ni = len(glob.glob(os.path.join(HERE, 'img', 'beat-*.png')))
             cards.append(f"""    <a class="card ok" href="factory.html">
       <div class="path">arch/x86/kernel/head_64.S &mdash; Boot Factory</div>
       <div class="nums">
         <span><b>{mt.group(1)}</b> instructions executed</span>
         <span><b>{nb}</b> hardware beats</span>
+        <span><b>{ni}</b> before/after images</span>
         <span><b>1</b> robot</span>
       </div>
       <div class="state ok">the first hardware the kernel touches &mdash; a robot moves every value</div>
