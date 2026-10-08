@@ -37,6 +37,25 @@ def main():
     rows.sort()
 
     cards = []
+    # The Boot Factory is a fixed artefact, not a per-file unit, so the walk above
+    # never finds it. Its numbers are read out of the built page rather than typed
+    # in — a hand-written count is the one thing that reliably goes stale here.
+    fp = os.path.join(HERE, 'factory.html')
+    if os.path.exists(fp):
+        fh = open(fp, encoding='utf-8', errors='replace').read()
+        mt = re.search(r'"total":(\d+)', fh)
+        mb = re.search(r'"beats":\[([0-9,]*)\]', fh)
+        if mt:
+            nb = len([x for x in (mb.group(1).split(',') if mb else []) if x])
+            cards.append(f"""    <a class="card ok" href="factory.html">
+      <div class="path">arch/x86/kernel/head_64.S &mdash; Boot Factory</div>
+      <div class="nums">
+        <span><b>{mt.group(1)}</b> instructions executed</span>
+        <span><b>{nb}</b> hardware beats</span>
+        <span><b>1</b> robot</span>
+      </div>
+      <div class="state ok">the first hardware the kernel touches &mdash; a robot moves every value</div>
+    </a>""")
     for rel, rel_src, st in rows:
         state = ('compiling' if st['missing'] == 0 else 'needs ops')
         cls = 'ok' if st['missing'] == 0 else 'todo'
